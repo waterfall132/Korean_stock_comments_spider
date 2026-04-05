@@ -11,7 +11,6 @@ from urllib.parse import urljoin, parse_qs, urlparse
 import requests
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
-from deep_translator import GoogleTranslator
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,26 +18,36 @@ from pydantic import BaseModel
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# =========================
+# 基础配置
+# =========================
 BASE_URL = "https://finance.naver.com/item/board.nhn"
 BASE_READ_URL = "https://finance.naver.com/item/board_read.naver"
 BASE_DOMAIN = "https://finance.naver.com"
 
 DB_PATH = os.getenv("DB_PATH", "naver_forum.db")
 
+# 翻译接口（你指定的）
+TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "https://60s.viki.moe/v2/fanyi")
+TRANSLATE_TIMEOUT = float(os.getenv("TRANSLATE_TIMEOUT", "15"))
+TRANSLATE_TARGET_MAP = {
+    "zh": "zh-CHS",
+    "en": "en",
+}
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# ===== requests session =====
+# =========================
+# Requests Session
+# =========================
 session = requests.Session()
 session.headers.update(HEADERS)
+session.trust_env = False  # 不读系统代理，避免脏环境干扰
 
-# 避免被系统奇怪代理影响（你之前就遇到了）
-session.trust_env = False
-
-# 可选：显式代理（Clash）
-# PowerShell示例：$env:CLASH_HTTP_PROXY="http://127.0.0.1:7890"
+# 可选 Clash 代理
 proxy_url = os.getenv("CLASH_HTTP_PROXY", "").strip()
 if proxy_url:
     session.proxies.update({
@@ -58,15 +67,16 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# 页面缓存：同一 code+page 缓存 60 秒
-page_cache = TTLCache(maxsize=500, ttl=60)
-# 翻译缓存：24小时
-translate_cache = TTLCache(maxsize=50000, ttl=86400)
-# 详情页缓存：10分钟
-detail_cache = TTLCache(maxsize=5000, ttl=600)
+# =========================
+# 缓存
+# =========================
+page_cache = TTLCache(maxsize=500, ttl=60)          # 列表页缓存 60s
+translate_cache = TTLCache(maxsize=50000, ttl=86400)  # 翻译缓存 24h
+detail_cache = TTLCache(maxsize=5000, ttl=600)      # 详情页缓存 10m
 
-
-# ===== Pydantic models =====
+# =========================
+# Pydantic models
+# =========================
 class PostItem(BaseModel):
     dedupe_key: str
     date: str
@@ -110,63 +120,22 @@ class PostDetailResponse(BaseModel):
     content: str
 
 
-# ===== app =====
-app = FastAPI(title="Naver Forum Crawler API", version="2.0.0")
+# =========================
+# FastAPI app
+# =========================
+app = FastAPI(title="Naver Forum Crawler API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产建议改成你的域名
+    allow_origins=["*"],  # 生产环境建议改为你的域名
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ===== DB =====
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS forum_posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT NOT NULL,
-        dedupe_key TEXT NOT NULL,
-        nid TEXT,
-        post_url TEXT NOT NULL,
-        date TEXT,
-        title_ko TEXT,
-        author TEXT,
-        views INTEGER DEFAULT 0,
-        likes INTEGER DEFAULT 0,
-        dislikes INTEGER DEFAULT 0,
-        comments INTEGER DEFAULT 0,
-        crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(code, dedupe_key)
-    )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_code_crawled ON forum_posts(code, crawled_at DESC)")
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS forum_post_details (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT NOT NULL,
-        dedupe_key TEXT NOT NULL,
-        nid TEXT,
-        post_url TEXT NOT NULL,
-        title_ko TEXT,
-        content_ko TEXT,
-        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(code, dedupe_key)
-    )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_detail_code_nid ON forum_post_details(code, nid)")
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-# ===== utils =====
+# =========================
+# 工具函数
+# =========================
 def to_int(text: str) -> int:
     if not text:
         return 0
@@ -207,7 +176,6 @@ def build_dedupe_key(code: str, nid: Optional[str], post_url: Optional[str], tit
 
 
 def dedupe_posts(posts: List[dict]) -> List[dict]:
-    """按 dedupe_key 去重，保留第一次出现"""
     seen = set()
     out = []
     for p in posts:
@@ -218,36 +186,180 @@ def dedupe_posts(posts: List[dict]) -> List[dict]:
         out.append(p)
     return out
 
+# =========================
+# 翻译（改为 60s.viki.moe）
+# =========================
+def _split_text_for_get(text: str, max_chars: int = 700) -> List[str]:
+    """GET query 参数长度限制，长文本分片"""
+    text = text or ""
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = re.split(r"(\n)", text)  # 保留换行
+    chunks, buf, cur = [], [], 0
+    for p in parts:
+        lp = len(p)
+        if cur + lp > max_chars and buf:
+            chunks.append("".join(buf))
+            buf, cur = [p], lp
+        else:
+            buf.append(p)
+            cur += lp
+    if buf:
+        chunks.append("".join(buf))
+    return chunks
+
+
+def _translate_viki_once(text: str, to_lang: str, from_lang: str = "auto") -> str:
+    params = {
+        "text": text,
+        "from": from_lang,
+        "to": to_lang,
+        "encoding": "json",
+    }
+    r = session.get(TRANSLATE_API_URL, params=params, timeout=TRANSLATE_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("code") != 200:
+        raise RuntimeError(f"翻译接口业务错误: {data.get('message', '')}")
+
+    target = (data.get("data") or {}).get("target") or {}
+    return str(target.get("text", "") or "")
+
 
 def translate_ko(text: str, lang: Literal["ko", "zh", "en"]) -> str:
-    if lang == "ko" or not text:
+    if not text or lang == "ko":
         return text
 
-    key = f"{lang}:{text}"
-    if key in translate_cache:
-        return translate_cache[key]
+    to_lang = TRANSLATE_TARGET_MAP.get(lang)
+    if not to_lang:
+        return text
 
-    target = "zh-CN" if lang == "zh" else "en"
+    cache_key = f"{lang}:{text}"
+    if cache_key in translate_cache:
+        return translate_cache[cache_key]
 
-    # 长文本分段翻译，避免一次过长失败
-    chunks = []
-    max_len = 3500
-    if len(text) <= max_len:
-        chunks = [text]
-    else:
-        for i in range(0, len(text), max_len):
-            chunks.append(text[i:i + max_len])
+    chunks = _split_text_for_get(text, max_chars=700)
+    out = []
 
-    results = []
     for c in chunks:
+        if not c:
+            out.append(c)
+            continue
         try:
-            results.append(GoogleTranslator(source="ko", target=target).translate(c) or c)
+            out.append(_translate_viki_once(c, to_lang=to_lang, from_lang="auto") or c)
         except Exception:
-            results.append(c)
+            out.append(c)  # 回退原文
+        time.sleep(0.05)  # 轻微节流
 
-    translated = "".join(results)
-    translate_cache[key] = translated
+    translated = "".join(out)
+    translate_cache[cache_key] = translated
     return translated
+
+# =========================
+# 数据库（自动迁移）
+# =========================
+def _get_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return [r[1] for r in rows]
+
+
+def init_db_and_migrate():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 1) forum_posts（先创建最小结构）
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS forum_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL,
+        nid TEXT,
+        post_url TEXT,
+        date TEXT,
+        title_ko TEXT,
+        author TEXT,
+        views INTEGER DEFAULT 0,
+        likes INTEGER DEFAULT 0,
+        dislikes INTEGER DEFAULT 0,
+        comments INTEGER DEFAULT 0,
+        crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    # 2) 补列（兼容旧库）
+    cols = set(_get_columns(conn, "forum_posts"))
+    if "dedupe_key" not in cols:
+        cur.execute("ALTER TABLE forum_posts ADD COLUMN dedupe_key TEXT")
+    if "post_url" not in cols:
+        cur.execute("ALTER TABLE forum_posts ADD COLUMN post_url TEXT")
+    if "comments" not in cols:
+        cur.execute("ALTER TABLE forum_posts ADD COLUMN comments INTEGER DEFAULT 0")
+
+    # 3) 回填 dedupe_key
+    rows = cur.execute("""
+        SELECT id, code, nid, post_url, title_ko, date
+        FROM forum_posts
+        WHERE dedupe_key IS NULL OR dedupe_key=''
+    """).fetchall()
+
+    for _id, code, nid, post_url, title_ko, date in rows:
+        key = build_dedupe_key(
+            code=code or "",
+            nid=nid,
+            post_url=post_url,
+            title_ko=title_ko or "",
+            date=date or ""
+        )
+        cur.execute("UPDATE forum_posts SET dedupe_key=? WHERE id=?", (key, _id))
+
+    # 4) 去重（同 code + dedupe_key 保留最新 id）
+    cur.execute("""
+    DELETE FROM forum_posts
+    WHERE id NOT IN (
+      SELECT MAX(id) FROM forum_posts
+      WHERE dedupe_key IS NOT NULL AND dedupe_key <> ''
+      GROUP BY code, dedupe_key
+    )
+    """)
+
+    # 5) 索引
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_forum_posts_code_dedupe
+    ON forum_posts(code, dedupe_key)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_posts_code_crawled
+    ON forum_posts(code, crawled_at DESC)
+    """)
+
+    # 6) 详情表
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS forum_post_details (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        nid TEXT,
+        post_url TEXT NOT NULL,
+        title_ko TEXT,
+        content_ko TEXT,
+        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_forum_post_details_code_dedupe
+    ON forum_post_details(code, dedupe_key)
+    """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_detail_code_nid
+    ON forum_post_details(code, nid)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db_and_migrate()
 
 
 def db_upsert_posts(code: str, posts: List[dict]):
@@ -313,8 +425,9 @@ def db_upsert_detail(code: str, dedupe_key: str, nid: Optional[str], post_url: s
     conn.commit()
     conn.close()
 
-
-# ===== crawler =====
+# =========================
+# 抓列表页
+# =========================
 def scrape_board_page(code: str, page: int) -> Tuple[List[dict], List[int], Optional[int]]:
     cache_key = f"{code}:{page}"
     if cache_key in page_cache:
@@ -392,21 +505,12 @@ def scrape_board_page(code: str, page: int) -> Tuple[List[dict], List[int], Opti
     page_cache[cache_key] = result
     return result
 
-
+# =========================
+# 抓详情页（含 iframe / NEXT_DATA）
+# =========================
 def _fetch_iframe_content(iframe_url: str, referer: str) -> str:
-    """
-    请求 iframe 子页面 (m.stock.naver.com/pc/domestic/stock/{code}/discussion/{nid})。
-    该页面是 Next.js SSR 页面，正文有两处可直接静态解析：
-      1. <script id="__NEXT_DATA__"> 里的 JSON（最稳定，优先使用）
-      2. <div class="se-main-container"> 里的 HTML 文本（备用）
-    注意：不能提前删除 script 标签，否则方案1失效。
-    """
-    # 使用桌面 UA —— m.stock.naver.com 对桌面 UA 同样返回 SSR HTML
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": HEADERS["User-Agent"],
         "Referer": referer,
         "Accept-Language": "ko-KR,ko;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -421,7 +525,7 @@ def _fetch_iframe_content(iframe_url: str, referer: str) -> str:
 
     raw = r.content.decode("utf-8", errors="replace")
 
-    # === 方案1：从 __NEXT_DATA__ JSON 提取纯文本（最稳定）===
+    # 方案1：__NEXT_DATA__
     m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, re.DOTALL)
     if m:
         try:
@@ -454,11 +558,10 @@ def _fetch_iframe_content(iframe_url: str, referer: str) -> str:
         except Exception:
             pass
 
-    # === 方案2：直接解析 HTML 中的 se-main-container ===
+    # 方案2：se-main-container
     soup = BeautifulSoup(raw, "html.parser")
     node = soup.select_one("div.se-main-container")
     if node:
-        # 只取 se-text-paragraph 段落里的 span 文本，避免噪声
         paragraphs = []
         for p in node.select("p.se-text-paragraph"):
             txt = clean_text(p.get_text(" ", strip=True))
@@ -466,12 +569,12 @@ def _fetch_iframe_content(iframe_url: str, referer: str) -> str:
                 paragraphs.append(txt)
         if paragraphs:
             return clean_text("\n".join(paragraphs))
-        # 备用：直接取 se-main-container 全文
         txt = clean_text(node.get_text("\n", strip=True))
         if len(txt) > 5:
             return txt
 
     return ""
+
 
 def scrape_post_detail(code: str, nid: Optional[str], post_url: Optional[str]) -> dict:
     if not post_url:
@@ -483,7 +586,6 @@ def scrape_post_detail(code: str, nid: Optional[str], post_url: Optional[str]) -
     if cache_key in detail_cache:
         return detail_cache[cache_key]
 
-    # 从 post_url 中补全 nid（如果调用方没传的话）
     if not nid:
         nid = extract_nid_from_href(post_url)
 
@@ -500,26 +602,26 @@ def scrape_post_detail(code: str, nid: Optional[str], post_url: Optional[str]) -
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"详情页状态码异常: {resp.status_code}")
 
-    # EUC-KR / UTF-8 编码自动检测
+    # 编码兼容
+    raw_text = ""
     for enc in (resp.apparent_encoding, "euc-kr", "utf-8"):
         try:
             raw_text = resp.content.decode(enc)
             break
-        except (UnicodeDecodeError, TypeError):
+        except Exception:
             continue
-    else:
+    if not raw_text:
         raw_text = resp.text
 
     soup = BeautifulSoup(raw_text, "html.parser")
 
-    # ---- 标题（从主页面取） ----
+    # 标题
     title_ko = ""
     og = soup.select_one("meta[property='og:title']")
     if og:
         title_ko = clean_text(og.get("content", ""))
     if not title_ko:
-        for sel in ["strong.c.p15", "div.view_top strong", "td.title strong",
-                    "span.tah.p15", "h3", "h4"]:
+        for sel in ["strong.c.p15", "div.view_top strong", "td.title strong", "span.tah.p15", "h3", "h4"]:
             node = soup.select_one(sel)
             if node:
                 t = clean_text(node.get_text(" ", strip=True))
@@ -527,27 +629,23 @@ def scrape_post_detail(code: str, nid: Optional[str], post_url: Optional[str]) -
                     title_ko = t
                     break
 
-    # ---- 正文：两步策略 ----
+    # 正文：先 iframe，再主页面
     content_ko = ""
 
-    # === 第一步：找 iframe src，请求子页面抓正文 ===
-    # Naver 现在把正文放在 iframe 内（src 指向 m.stock.naver.com）
     iframe_src = ""
     iframe_node = soup.select_one("iframe#contents, iframe[name='contents']")
     if iframe_node:
         iframe_src = iframe_node.get("src", "").strip()
 
-    # 如果主页面 iframe src 为空或没有 iframe，直接构造子页面 URL
     if not iframe_src and nid:
         iframe_src = f"https://m.stock.naver.com/pc/domestic/stock/{code}/discussion/{nid}"
 
     if iframe_src:
-        content_ko = _fetch_iframe_content(iframe_src, referer=post_url)
+        iframe_url = urljoin(post_url, iframe_src)
+        content_ko = _fetch_iframe_content(iframe_url, referer=post_url)
 
-    # === 第二步：极少数旧格式帖子，正文直接在主页面 HTML 里 ===
     if not content_ko:
-        for sel in ["td.view_se", "div.view_se", "td#body", "div#body",
-                    "div.se-main-container", "div.post_ct"]:
+        for sel in ["td.view_se", "div.view_se", "td#body", "div#body", "div.se-main-container", "div.post_ct"]:
             node = soup.select_one(sel)
             if node:
                 for tag in node.select("script, style, noscript, iframe"):
@@ -573,11 +671,17 @@ def scrape_post_detail(code: str, nid: Optional[str], post_url: Optional[str]) -
     detail_cache[cache_key] = data
     return data
 
-
-# ===== API =====
+# =========================
+# API
+# =========================
 @app.get("/api/health")
 def health():
-    return {"ok": True, "db": DB_PATH, "proxy": proxy_url or "disabled"}
+    return {
+        "ok": True,
+        "db": DB_PATH,
+        "proxy": proxy_url or "disabled",
+        "translator": TRANSLATE_API_URL
+    }
 
 
 @app.get("/api/posts", response_model=PostsResponse)
@@ -592,12 +696,10 @@ def get_posts(
     if save_db:
         db_upsert_posts(code, posts_raw)
 
-    posts = []
-    for p in posts_raw:
-        posts.append(PostItem(
-            **p,
-            title=translate_ko(p["title_ko"], lang)
-        ))
+    posts = [
+        PostItem(**p, title=translate_ko(p["title_ko"], lang))
+        for p in posts_raw
+    ]
 
     return PostsResponse(
         code=code,
@@ -629,18 +731,15 @@ def get_posts_range(
         all_posts.extend(posts_raw)
         time.sleep(random.uniform(0.4, 1.0))
 
-    # 跨页去重（重点：防重复显示）
-    all_posts = dedupe_posts(all_posts)
+    all_posts = dedupe_posts(all_posts)  # 跨页去重
 
     if save_db:
         db_upsert_posts(code, all_posts)
 
-    ret = []
-    for row in all_posts:
-        ret.append(PostItem(
-            **row,
-            title=translate_ko(row["title_ko"], lang)
-        ))
+    ret = [
+        PostItem(**row, title=translate_ko(row["title_ko"], lang))
+        for row in all_posts
+    ]
 
     return RangeResponse(
         code=code,
@@ -661,7 +760,6 @@ def get_post_detail(
     force_refresh: bool = Query(False),
     save_db: bool = Query(True)
 ):
-    # dedupe_key用于详情缓存
     temp_key = build_dedupe_key(code, nid, post_url, "", "")
 
     # 先查库
@@ -678,9 +776,11 @@ def get_post_detail(
                 content=translate_ko(db_data.get("content_ko", ""), lang)
             )
 
-    # 实时抓
+    # 实时抓取
     detail = scrape_post_detail(code, nid, post_url)
-    final_key = build_dedupe_key(code, detail.get("nid"), detail.get("post_url"), detail.get("title_ko", ""), "")
+    final_key = build_dedupe_key(
+        code, detail.get("nid"), detail.get("post_url"), detail.get("title_ko", ""), ""
+    )
 
     if save_db:
         db_upsert_detail(
