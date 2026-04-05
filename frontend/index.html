@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Naver 股票论坛可视化</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; margin: 0; padding: 16px 20px; background: #f0f2f5; color: #222; }
+    h2 { margin: 0 0 14px; font-size: 20px; }
+
+    /* ---- 面板 ---- */
+    .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+
+    /* ---- 控制行 ---- */
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .row label { font-size: 13px; white-space: nowrap; }
+    input[type=text], input[type=number], select {
+      padding: 6px 8px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px;
+    }
+    button {
+      padding: 6px 12px; border: 1px solid #bbb; border-radius: 5px;
+      background: #f8f8f8; cursor: pointer; font-size: 13px; white-space: nowrap;
+    }
+    button:hover { background: #e8e8e8; }
+    button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+    button.primary:hover { background: #1d4ed8; }
+    button.danger  { background: #dc2626; color: #fff; border-color: #dc2626; }
+    button.danger:hover  { background: #b91c1c; }
+
+    /* ---- 状态 / 提示 ---- */
+    .muted  { color: #888; font-size: 12px; }
+    .status { font-size: 12px; min-height: 18px; padding: 2px 0; }
+    .status.ok    { color: #16a34a; }
+    .status.err   { color: #dc2626; }
+    .status.warn  { color: #d97706; }
+
+    /* ---- Toast ---- */
+    #toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(60px);
+      background: #1e1e2e; color: #fff; padding: 10px 20px; border-radius: 8px;
+      font-size: 13px; opacity: 0; transition: all .3s; z-index: 99999; pointer-events: none;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #toast.toast-ok  { background: #16a34a; }
+    #toast.toast-err { background: #dc2626; }
+
+    /* ---- 过滤条 ---- */
+    .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .filter-bar input { width: 160px; }
+
+    /* ---- 图表 ---- */
+    #chart1, #chart2 { width: 100%; height: 300px; }
+    .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media(max-width: 700px) { .charts-row { grid-template-columns: 1fr; } }
+
+    /* ---- 表格 ---- */
+    .table-wrap { max-height: 480px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid #e5e5e5; padding: 7px 9px; font-size: 13px; }
+    th {
+      background: #f1f3f5; position: sticky; top: 0; z-index: 1;
+      cursor: pointer; user-select: none; white-space: nowrap;
+    }
+    th:hover { background: #e4e7ea; }
+    th .sort-icon { margin-left: 4px; font-size: 10px; color: #888; }
+    th.sorted { color: #2563eb; }
+    tr:hover td { background: #f9fafb; }
+    .title-cell { max-width: 400px; word-break: break-all; }
+    .link-title { color: #2563eb; text-decoration: underline; cursor: pointer; }
+    .link-title:hover { color: #1d4ed8; }
+    .badge-warn { font-size: 10px; color: #d97706; margin-left: 4px; }
+    td.num { text-align: right; }
+    td.pos { color: #16a34a; text-align: right; }
+    td.neg { color: #dc2626; text-align: right; }
+    .empty-row td { text-align: center; color: #888; padding: 24px; }
+
+    /* ---- 自动刷新状态 ---- */
+    #autoRefreshStatus {
+      font-size: 12px; color: #2563eb; min-width: 120px;
+    }
+    #countdownBar {
+      height: 3px; background: #2563eb; border-radius: 2px;
+      transition: width linear;
+    }
+
+    /* ---- 详情弹窗 ---- */
+    .modal-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45);
+      display: none; align-items: center; justify-content: center; z-index: 9999;
+    }
+    .modal-mask.show { display: flex; }
+    .modal {
+      width: min(960px, 94vw); max-height: 90vh;
+      background: #fff; border-radius: 12px; overflow: hidden;
+      box-shadow: 0 12px 36px rgba(0,0,0,.25);
+      display: flex; flex-direction: column;
+    }
+    .modal-header {
+      padding: 12px 16px; border-bottom: 1px solid #eee;
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+      flex-shrink: 0;
+    }
+    .modal-title { font-size: 16px; font-weight: 700; margin: 0; line-height: 1.5; flex: 1; }
+    .modal-tools { display: flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
+    .modal-body { padding: 14px 16px; overflow: auto; flex: 1; }
+    .modal-content { white-space: pre-wrap; line-height: 1.75; font-size: 14px; color: #222; }
+    .modal-meta { color: #888; font-size: 12px; margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+    .modal-meta a { color: #2563eb; text-decoration: underline; }
+    .btn-close { border: none; background: #f1f3f5; padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+    .btn-close:hover { background: #e5e7eb; }
+    .translate-hint { font-size: 12px; color: #d97706; margin-top: 8px; }
+
+    /* ---- skeleton ---- */
+    @keyframes shimmer {
+      0%   { background-position: -400px 0; }
+      100% { background-position: 400px 0; }
+    }
+    .skeleton {
+      background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%);
+      background-size: 800px 100%;
+      animation: shimmer 1.4s infinite;
+      border-radius: 4px;
+    }
+    .skeleton-line { height: 14px; margin: 6px 0; }
+    .skeleton-line.short { width: 40%; }
+    .skeleton-line.med   { width: 70%; }
+    .skeleton-line.long  { width: 95%; }
+  </style>
+</head>
+<body>
+
+<h2>Naver Finance 论坛爬虫可视化</h2>
+
+<!-- ====== 控制面板 ====== -->
+<div class="panel">
+  <div class="row">
+    <label>股票代码:
+      <input id="code" value="000660" style="width:90px" maxlength="6" pattern="\d{6}">
+    </label>
+
+    <label>列表语言:
+      <select id="lang">
+        <option value="ko">韩文原文</option>
+        <option value="zh" selected>中文</option>
+        <option value="en">English</option>
+      </select>
+    </label>
+
+    <label>单页:
+      <input id="page" type="number" value="1" min="1" style="width:70px">
+    </label>
+    <button class="primary" onclick="loadSingle()">抓取单页</button>
+
+    <label>区间:
+      <input id="startPage" type="number" value="1" min="1" style="width:60px"> ~
+      <input id="endPage"   type="number" value="3" min="1" style="width:60px">
+    </label>
+    <button onclick="loadRange()">抓取区间</button>
+  </div>
+
+  <!-- 自动刷新 -->
+  <div class="row" style="margin-top:10px;">
+    <label>自动刷新:
+      <select id="autoInterval">
+        <option value="0">关闭</option>
+        <option value="30">30 秒</option>
+        <option value="60">1 分钟</option>
+        <option value="300">5 分钟</option>
+      </select>
+    </label>
+    <span id="autoRefreshStatus"></span>
+    <div style="flex:1; max-width:200px; background:#e5e7eb; border-radius:2px; overflow:hidden; height:3px;">
+      <div id="countdownBar" style="width:100%;"></div>
+    </div>
+    <button id="stopAutoBtn" style="display:none;" class="danger" onclick="stopAutoRefresh()">停止刷新</button>
+  </div>
+
+  <p class="muted" style="margin:8px 0 4px">提示：点击标题可查看帖子正文；点击列标题可排序。</p>
+  <div id="status" class="status"></div>
+</div>
+
+<!-- ====== 图表 ====== -->
+<div class="charts-row">
+  <div class="panel"><div id="chart1"></div></div>
+  <div class="panel"><div id="chart2"></div></div>
+</div>
+
+<!-- ====== 过滤 + 表格 ====== -->
+<div class="panel">
+  <div class="filter-bar" style="margin-bottom:10px;">
+    <input id="filterText" type="text" placeholder="标题 / 作者 关键词过滤…" oninput="applyFilter()">
+    <label style="font-size:13px;">最少浏览:
+      <input id="filterViews" type="number" value="0" min="0" style="width:70px" oninput="applyFilter()">
+    </label>
+    <label style="font-size:13px;">最少评论:
+      <input id="filterComments" type="number" value="0" min="0" style="width:70px" oninput="applyFilter()">
+    </label>
+    <label style="font-size:13px;">净推荐 ≥:
+      <input id="filterNet" type="number" value="" style="width:70px" placeholder="不限" oninput="applyFilter()">
+    </label>
+    <button onclick="resetFilter()">重置</button>
+    <span id="filterCount" class="muted"></span>
+  </div>
+
+  <div class="table-wrap">
+    <table id="mainTable">
+      <thead>
+        <tr>
+          <th data-col="date"     onclick="sortBy('date')">日期 <span class="sort-icon">↕</span></th>
+          <th>标题（可点击）</th>
+          <th>韩文原文</th>
+          <th data-col="author"   onclick="sortBy('author')">作者 <span class="sort-icon">↕</span></th>
+          <th data-col="views"    onclick="sortBy('views')"   class="num">浏览 <span class="sort-icon">↕</span></th>
+          <th data-col="likes"    onclick="sortBy('likes')"   class="num">推荐 <span class="sort-icon">↕</span></th>
+          <th data-col="dislikes" onclick="sortBy('dislikes')" class="num">非推荐 <span class="sort-icon">↕</span></th>
+          <th data-col="comments" onclick="sortBy('comments')" class="num">评论 <span class="sort-icon">↕</span></th>
+          <th data-col="net"      onclick="sortBy('net')"      class="num">净推荐 <span class="sort-icon">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ====== 详情弹窗 ====== -->
+<div id="detailModalMask" class="modal-mask">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <h3 id="detailTitle" class="modal-title">帖子详情</h3>
+      <div class="modal-tools">
+        <label class="muted" style="font-size:12px;">语言:
+          <select id="detailLang">
+            <option value="ko">韩文</option>
+            <option value="zh" selected>中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <button id="detailOpenBtn" class="btn-close" title="在 Naver 打开原帖" onclick="openOriginal()">🔗 原帖</button>
+        <button id="detailRefreshBtn" class="btn-close">刷新</button>
+        <button id="detailCloseBtn"   class="btn-close">✕ 关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="modal-meta" id="detailMeta"></div>
+      <hr style="margin:0 0 12px; border-color:#eee;">
+      <div id="detailContent" class="modal-content">加载中...</div>
+      <div id="translateHint" class="translate-hint" style="display:none;">
+        ⚠ 翻译失败，已显示原文
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== Toast ====== -->
+<div id="toast"></div>
+
+<script>
+// ============================================================
+// 全局状态
+// ============================================================
+const chart1 = echarts.init(document.getElementById('chart1'));
+const chart2 = echarts.init(document.getElementById('chart2'));
+
+let allPosts        = [];      // 当前加载的全部帖子（原始）
+let filteredPosts   = [];      // 过滤后
+let currentCode     = "000660";
+let currentDetailRef= null;    // {code, nid, post_url}
+let sortCol         = "";
+let sortAsc         = false;
+let fetchController = null;    // AbortController（取消旧请求）
+let autoTimer       = null;    // 自动刷新 setInterval
+let countdownTimer  = null;    // 倒计时动画
+let lastMode        = null;    // "single" | "range"（自动刷新时重复上次操作）
+
+// ============================================================
+// localStorage 记忆偏好
+// ============================================================
+function savePref() {
+  try {
+    localStorage.setItem("nf_code",     document.getElementById("code").value);
+    localStorage.setItem("nf_lang",     document.getElementById("lang").value);
+    localStorage.setItem("nf_page",     document.getElementById("page").value);
+    localStorage.setItem("nf_start",    document.getElementById("startPage").value);
+    localStorage.setItem("nf_end",      document.getElementById("endPage").value);
+    localStorage.setItem("nf_dlang",    document.getElementById("detailLang").value);
+    localStorage.setItem("nf_interval", document.getElementById("autoInterval").value);
+  } catch(e) {}
+}
+
+function loadPref() {
+  try {
+    const s = k => localStorage.getItem(k);
+    if (s("nf_code"))  document.getElementById("code").value      = s("nf_code");
+    if (s("nf_lang"))  document.getElementById("lang").value      = s("nf_lang");
+    if (s("nf_page"))  document.getElementById("page").value      = s("nf_page");
+    if (s("nf_start")) document.getElementById("startPage").value = s("nf_start");
+    if (s("nf_end"))   document.getElementById("endPage").value   = s("nf_end");
+    if (s("nf_dlang")) document.getElementById("detailLang").value= s("nf_dlang");
+    if (s("nf_interval")) document.getElementById("autoInterval").value = s("nf_interval");
+  } catch(e) {}
+}
+
+// ============================================================
+// URL 参数同步
+// ============================================================
+function syncUrlParams() {
+  const code  = document.getElementById("code").value;
+  const lang  = document.getElementById("lang").value;
+  const page  = document.getElementById("page").value;
+  const start = document.getElementById("startPage").value;
+  const end   = document.getElementById("endPage").value;
+  const params = new URLSearchParams({ code, lang, page, start, end });
+  history.replaceState(null, "", "?" + params.toString());
+}
+
+function loadUrlParams() {
+  const p = new URLSearchParams(location.search);
+  if (p.get("code"))  document.getElementById("code").value      = p.get("code");
+  if (p.get("lang"))  document.getElementById("lang").value      = p.get("lang");
+  if (p.get("page"))  document.getElementById("page").value      = p.get("page");
+  if (p.get("start")) document.getElementById("startPage").value = p.get("start");
+  if (p.get("end"))   document.getElementById("endPage").value   = p.get("end");
+}
+
+// ============================================================
+// Toast
+// ============================================================
+let toastTimer = null;
+function showToast(msg, type="") {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "show" + (type ? " toast-" + type : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ""; }, 3000);
+}
+
+// ============================================================
+// 状态栏
+// ============================================================
+function setStatus(msg, type="") {
+  const el = document.getElementById("status");
+  el.textContent = msg || "";
+  el.className = "status " + type;
+}
+
+// ============================================================
+// 工具函数
+// ============================================================
+function escapeHtml(str = "") {
+  return String(str)
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function shortText(s, n = 16) {
+  s = s || "";
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// ============================================================
+// 表格渲染
+// ============================================================
+function renderTable(posts) {
+  const tbody = document.getElementById("tbody");
+  if (!posts || posts.length === 0) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="9">暂无数据</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = posts.map(p => {
+    const net = (p.likes ?? 0) - (p.dislikes ?? 0);
+    const netClass = net > 0 ? "pos" : net < 0 ? "neg" : "num";
+    return `
+    <tr>
+      <td>${escapeHtml(p.date || "")}</td>
+      <td class="title-cell">
+        <a class="link-title detail-link"
+          data-code="${encodeURIComponent(currentCode)}"
+          data-nid="${encodeURIComponent(p.nid || "")}"
+          data-url="${encodeURIComponent(p.post_url || "")}">
+          ${escapeHtml(p.title || p.title_ko || "")}
+        </a>
+        ${p.translated === false ? '<span class="badge-warn" title="翻译失败">⚠</span>' : ""}
+      </td>
+      <td class="title-cell">${escapeHtml(p.title_ko || "")}</td>
+      <td>${escapeHtml(p.author || "")}</td>
+      <td class="num">${p.views ?? 0}</td>
+      <td class="num">${p.likes ?? 0}</td>
+      <td class="num">${p.dislikes ?? 0}</td>
+      <td class="num">${p.comments ?? 0}</td>
+      <td class="${netClass}">${net}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ============================================================
+// 排序
+// ============================================================
+function sortBy(col) {
+  if (sortCol === col) {
+    sortAsc = !sortAsc;
+  } else {
+    sortCol = col;
+    sortAsc = false;
+  }
+  // 更新表头图标
+  document.querySelectorAll("th[data-col]").forEach(th => {
+    th.classList.remove("sorted");
+    th.querySelector(".sort-icon").textContent = "↕";
+  });
+  const activeTh = document.querySelector(`th[data-col="${col}"]`);
+  if (activeTh) {
+    activeTh.classList.add("sorted");
+    activeTh.querySelector(".sort-icon").textContent = sortAsc ? "↑" : "↓";
+  }
+  applyFilter();
+}
+
+function getSortedPosts(posts) {
+  if (!sortCol) return posts;
+  const valOf = p => {
+    if (sortCol === "net") return (p.likes || 0) - (p.dislikes || 0);
+    return p[sortCol] ?? "";
+  };
+  return [...posts].sort((a, b) => {
+    const va = valOf(a), vb = valOf(b);
+    if (typeof va === "number") return sortAsc ? va - vb : vb - va;
+    return sortAsc
+      ? String(va).localeCompare(String(vb))
+      : String(vb).localeCompare(String(va));
+  });
+}
+
+// ============================================================
+// 过滤
+// ============================================================
+function applyFilter() {
+  const kw      = document.getElementById("filterText").value.trim().toLowerCase();
+  const minV    = parseInt(document.getElementById("filterViews").value)    || 0;
+  const minC    = parseInt(document.getElementById("filterComments").value) || 0;
+  const netRaw  = document.getElementById("filterNet").value.trim();
+  const minNet  = netRaw !== "" ? parseInt(netRaw) : null;
+
+  filteredPosts = allPosts.filter(p => {
+    const title  = ((p.title || "") + (p.title_ko || "")).toLowerCase();
+    const author = (p.author || "").toLowerCase();
+    if (kw && !title.includes(kw) && !author.includes(kw)) return false;
+    if ((p.views    || 0) < minV) return false;
+    if ((p.comments || 0) < minC) return false;
+    if (minNet !== null) {
+      const net = (p.likes || 0) - (p.dislikes || 0);
+      if (net < minNet) return false;
+    }
+    return true;
+  });
+
+  const sorted = getSortedPosts(filteredPosts);
+  renderTable(sorted);
+  document.getElementById("filterCount").textContent =
+    filteredPosts.length < allPosts.length
+      ? `过滤后 ${filteredPosts.length} / ${allPosts.length} 条`
+      : `共 ${allPosts.length} 条`;
+}
+
+function resetFilter() {
+  document.getElementById("filterText").value     = "";
+  document.getElementById("filterViews").value    = "0";
+  document.getElementById("filterComments").value = "0";
+  document.getElementById("filterNet").value      = "";
+  applyFilter();
+}
+
+// ============================================================
+// ECharts
+// ============================================================
+
+// 保存当前图表对应的帖子，供点击事件使用
+let chartTopPosts = [];
+
+function renderCharts(posts) {
+  chartTopPosts = [...posts].sort((a,b)=>(b.views||0)-(a.views||0)).slice(0,10);
+  const labels = chartTopPosts.map(x => shortText(x.title || x.title_ko, 10));
+
+  // ---- 通用 tooltip formatter：显示完整标题 + 数值 ----
+  const tooltipFormatter1 = params => {
+    const idx = params[0]?.dataIndex ?? params.dataIndex;
+    const p   = chartTopPosts[idx];
+    if (!p) return "";
+    const title = escapeHtml(p.title || p.title_ko || "");
+    return `<div style="max-width:280px;white-space:normal;line-height:1.5">
+              <b style="font-size:12px">${title}</b><br>
+              浏览: <b>${p.views ?? 0}</b>
+            </div>`;
+  };
+
+  const tooltipFormatter2 = params => {
+    // params 是数组（trigger: axis）
+    const idx = Array.isArray(params) ? params[0]?.dataIndex : params.dataIndex;
+    const p   = chartTopPosts[idx];
+    if (!p) return "";
+    const title = escapeHtml(p.title || p.title_ko || "");
+    const rows  = params.map(s =>
+      `${escapeHtml(s.seriesName)}: <b>${s.value}</b>`
+    ).join("<br>");
+    return `<div style="max-width:280px;white-space:normal;line-height:1.6">
+              <b style="font-size:12px">${title}</b><br>${rows}
+            </div>`;
+  };
+
+  // ---- chart1：Top10 浏览量 ----
+  chart1.hideLoading();
+  chart1.setOption({
+    title: {
+      text: "Top10 浏览量",
+      subtext: "点击柱子查看帖子详情",
+      textStyle: { fontSize: 14 },
+      subtextStyle: { fontSize: 11, color: "#888" }
+    },
+    tooltip: {
+      trigger: "axis",
+      formatter: tooltipFormatter1
+    },
+    grid: { left: 60, right: 20, bottom: 60, top: 56 },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: { rotate: 30, fontSize: 11 },
+      triggerEvent: false
+    },
+    yAxis: { type: "value" },
+    series: [{
+      type: "bar",
+      data: chartTopPosts.map(x => x.views || 0),
+      itemStyle: { color: "#2563eb" },
+      emphasis: { itemStyle: { color: "#1d4ed8", shadowBlur: 6, shadowColor: "rgba(37,99,235,.4)" } },
+      cursor: "pointer"
+    }]
+  });
+
+  // ---- chart2：推荐 vs 非推荐 ----
+  chart2.hideLoading();
+  chart2.setOption({
+    title: {
+      text: "推荐 vs 非推荐（Top10 浏览）",
+      subtext: "点击柱子查看帖子详情",
+      textStyle: { fontSize: 14 },
+      subtextStyle: { fontSize: 11, color: "#888" }
+    },
+    tooltip: {
+      trigger: "axis",
+      formatter: tooltipFormatter2
+    },
+    legend: { data: ["推荐", "非推荐"], top: 28 },
+    grid: { left: 60, right: 20, bottom: 60, top: 70 },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLabel: { rotate: 30, fontSize: 11 }
+    },
+    yAxis: { type: "value" },
+    series: [
+      {
+        name: "推荐",   type: "bar",
+        data: chartTopPosts.map(x => x.likes    || 0),
+        itemStyle: { color: "#16a34a" },
+        emphasis: { itemStyle: { color: "#15803d", shadowBlur: 6, shadowColor: "rgba(22,163,74,.4)" } },
+        cursor: "pointer"
+      },
+      {
+        name: "非推荐", type: "bar",
+        data: chartTopPosts.map(x => x.dislikes || 0),
+        itemStyle: { color: "#dc2626" },
+        emphasis: { itemStyle: { color: "#b91c1c", shadowBlur: 6, shadowColor: "rgba(220,38,38,.4)" } },
+        cursor: "pointer"
+      }
+    ]
+  });
+
+  // ---- 绑定点击事件（只绑定一次，用 off 先清掉旧的）----
+  chart1.off("click");
+  chart1.on("click", params => {
+    const p = chartTopPosts[params.dataIndex];
+    if (!p) return;
+    currentDetailRef = {
+      code: currentCode,
+      nid:      p.nid      || "",
+      post_url: p.post_url || ""
+    };
+    loadDetail(false);
+  });
+
+  chart2.off("click");
+  chart2.on("click", params => {
+    const p = chartTopPosts[params.dataIndex];
+    if (!p) return;
+    currentDetailRef = {
+      code: currentCode,
+      nid:      p.nid      || "",
+      post_url: p.post_url || ""
+    };
+    loadDetail(false);
+  });
+}
+
+// ============================================================
+// 抓取：取消旧请求
+// ============================================================
+function cancelPending() {
+  if (fetchController) {
+    fetchController.abort();
+    fetchController = null;
+  }
+}
+
+// ============================================================
+// 抓取单页
+// ============================================================
+async function loadSingle(silent = false) {
+  cancelPending();
+  fetchController = new AbortController();
+  const sig = fetchController.signal;
+
+  const code  = document.getElementById("code").value.trim();
+  const page  = document.getElementById("page").value;
+  const lang  = document.getElementById("lang").value;
+  currentCode = code;
+  lastMode    = "single";
+  savePref();
+  syncUrlParams();
+
+  if (!silent) {
+    chart1.showLoading({ text: "加载中…", fontSize: 13 });
+    chart2.showLoading({ text: "加载中…", fontSize: 13 });
+    setStatus("加载中…");
+  }
+
+  try {
+    const res = await fetch(
+      `/api/posts?code=${encodeURIComponent(code)}&page=${page}&lang=${lang}`,
+      { signal: sig }
+    );
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt);
+    }
+    const data = await res.json();
+    allPosts = data.posts || [];
+    resetFilter();
+    renderCharts(allPosts);
+    setStatus(
+      `page=${data.page}，共 ${data.count} 条，可用页: [${(data.available_pages||[]).join(",")}]`,
+      "ok"
+    );
+    if (silent) showToast("数据已自动刷新", "ok");
+  } catch(e) {
+    if (e.name === "AbortError") return;
+    const msg = "请求失败: " + e.message;
+    setStatus(msg, "err");
+    showToast(msg, "err");
+    chart1.hideLoading();
+    chart2.hideLoading();
+  }
+}
+
+// ============================================================
+// 抓取区间
+// ============================================================
+async function loadRange(silent = false) {
+  cancelPending();
+  fetchController = new AbortController();
+  const sig = fetchController.signal;
+
+  const code  = document.getElementById("code").value.trim();
+  const start = document.getElementById("startPage").value;
+  const end   = document.getElementById("endPage").value;
+  const lang  = document.getElementById("lang").value;
+  currentCode = code;
+  lastMode    = "range";
+  savePref();
+  syncUrlParams();
+
+  if (!silent) {
+    chart1.showLoading({ text: "加载中…", fontSize: 13 });
+    chart2.showLoading({ text: "加载中…", fontSize: 13 });
+    setStatus("区间抓取中…");
+  }
+
+  try {
+    const res = await fetch(
+      `/api/posts/range?code=${encodeURIComponent(code)}&start_page=${start}&end_page=${end}&lang=${lang}`,
+      { signal: sig }
+    );
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt);
+    }
+    const data = await res.json();
+    allPosts = data.posts || [];
+    resetFilter();
+    renderCharts(allPosts);
+    setStatus(
+      `区间 ${data.start_page}~${data.end_page}，去重后 ${data.count} 条`,
+      "ok"
+    );
+    if (silent) showToast("数据已自动刷新", "ok");
+  } catch(e) {
+    if (e.name === "AbortError") return;
+    const msg = "请求失败: " + e.message;
+    setStatus(msg, "err");
+    showToast(msg, "err");
+    chart1.hideLoading();
+    chart2.hideLoading();
+  }
+}
+
+// ============================================================
+// 自动刷新
+// ============================================================
+function stopAutoRefresh() {
+  clearInterval(autoTimer);
+  clearInterval(countdownTimer);
+  autoTimer = countdownTimer = null;
+  document.getElementById("autoRefreshStatus").textContent = "";
+  document.getElementById("countdownBar").style.width = "100%";
+  document.getElementById("stopAutoBtn").style.display = "none";
+}
+
+document.getElementById("autoInterval").addEventListener("change", function() {
+  stopAutoRefresh();
+  const sec = parseInt(this.value);
+  savePref();
+  if (!sec) return;
+
+  document.getElementById("stopAutoBtn").style.display = "";
+  let remaining = sec;
+
+  const tick = () => {
+    remaining--;
+    const pct = (remaining / sec * 100).toFixed(1) + "%";
+    document.getElementById("countdownBar").style.width = pct;
+    document.getElementById("autoRefreshStatus").textContent =
+      `下次刷新: ${remaining}s`;
+    if (remaining <= 0) {
+      remaining = sec;
+      document.getElementById("countdownBar").style.width = "100%";
+      // 触发刷新（静默模式）
+      if (lastMode === "range") loadRange(true);
+      else loadSingle(true);
+    }
+  };
+
+  countdownTimer = setInterval(tick, 1000);
+  document.getElementById("autoRefreshStatus").textContent = `下次刷新: ${sec}s`;
+  document.getElementById("countdownBar").style.width = "100%";
+});
+
+// ============================================================
+// 表格点击 → 详情弹窗
+// ============================================================
+document.getElementById("tbody").addEventListener("click", async (e) => {
+  const a = e.target.closest(".detail-link");
+  if (!a) return;
+  const code    = decodeURIComponent(a.dataset.code || "");
+  const nid     = decodeURIComponent(a.dataset.nid  || "");
+  const post_url= decodeURIComponent(a.dataset.url  || "");
+  currentDetailRef = { code, nid, post_url };
+  await loadDetail(false);
+});
+
+// ============================================================
+// 详情弹窗
+// ============================================================
+function showDetailModal() { document.getElementById("detailModalMask").classList.add("show"); }
+function hideDetailModal() { document.getElementById("detailModalMask").classList.remove("show"); }
+
+function openOriginal() {
+  if (!currentDetailRef) return;
+  const { code, nid, post_url } = currentDetailRef;
+  const url = post_url || (nid
+    ? `https://finance.naver.com/item/board_read.naver?code=${code}&nid=${nid}&page=1`
+    : "");
+  if (url) window.open(url, "_blank", "noopener");
+}
+
+async function loadDetail(forceRefresh = false) {
+  if (!currentDetailRef) return;
+  const { code, nid, post_url } = currentDetailRef;
+  const lang = document.getElementById("detailLang").value;
+
+  showDetailModal();
+  document.getElementById("detailTitle").textContent   = "加载中…";
+  document.getElementById("detailMeta").innerHTML      = "";
+  document.getElementById("translateHint").style.display = "none";
+  // skeleton
+  document.getElementById("detailContent").innerHTML =
+    `<div class="skeleton skeleton-line long"></div>
+     <div class="skeleton skeleton-line med"></div>
+     <div class="skeleton skeleton-line long"></div>
+     <div class="skeleton skeleton-line short"></div>`;
+
+  try {
+    const params = new URLSearchParams();
+    params.set("code", code);
+    params.set("lang", lang);
+    params.set("force_refresh", forceRefresh ? "true" : "false");
+    if (nid)      params.set("nid",      nid);
+    else if (post_url) params.set("post_url", post_url);
+
+    const res = await fetch(`/api/post/detail?${params.toString()}`);
+    if (!res.ok) throw new Error(await res.text());
+
+    const data = await res.json();
+
+    document.getElementById("detailTitle").textContent = data.title || data.title_ko || "（无标题）";
+
+    // meta：原帖链接
+    const metaEl = document.getElementById("detailMeta");
+    metaEl.innerHTML =
+      `<span>code=${escapeHtml(data.code)}</span>` +
+      `<span>nid=${escapeHtml(data.nid || "-")}</span>` +
+      (data.post_url
+        ? `<a href="${escapeHtml(data.post_url)}" target="_blank" rel="noopener">🔗 在 Naver 查看原帖</a>`
+        : "");
+
+    const contentEl = document.getElementById("detailContent");
+    contentEl.className = "modal-content";
+    contentEl.textContent = data.content || data.content_ko || "（正文为空）";
+
+    // 翻译失败提示
+    if (data.translated === false) {
+      document.getElementById("translateHint").style.display = "";
+    }
+    savePref();
+  } catch(e) {
+    document.getElementById("detailTitle").textContent = "加载失败";
+    document.getElementById("detailContent").className = "modal-content";
+    document.getElementById("detailContent").textContent = String(e);
+    showToast("详情加载失败", "err");
+  }
+}
+
+document.getElementById("detailLang").addEventListener("change", () => loadDetail(false));
+document.getElementById("detailRefreshBtn").addEventListener("click", () => loadDetail(true));
+document.getElementById("detailCloseBtn").addEventListener("click", hideDetailModal);
+document.getElementById("detailModalMask").addEventListener("click", e => {
+  if (e.target === document.getElementById("detailModalMask")) hideDetailModal();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") hideDetailModal();
+});
+
+// ============================================================
+// 初始化
+// ============================================================
+(function init() {
+  loadUrlParams();    // URL 参数优先
+  loadPref();         // 其次 localStorage
+  currentCode = document.getElementById("code").value;
+
+  // 恢复自动刷新设置
+  const savedInterval = document.getElementById("autoInterval").value;
+  if (savedInterval && savedInterval !== "0") {
+    // 触发 change 事件启动定时器
+    document.getElementById("autoInterval").dispatchEvent(new Event("change"));
+  }
+
+  loadSingle();
+})();
+
+window.addEventListener("resize", () => { chart1.resize(); chart2.resize(); });
+</script>
+</body>
+</html>
